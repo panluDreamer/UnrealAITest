@@ -1,0 +1,417 @@
+"""E2E tests for VFS navigation commands (ls, cat, tree).
+
+Black-box tests that invoke the real CLI via subprocess against a captured
+session. Requires a working renderdoc installation. All IDs are discovered
+dynamically via the ``capture_meta`` fixture.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+from e2e_helpers import CaptureMetadata, rdc_fail, rdc_ok
+
+pytestmark = pytest.mark.gpu
+
+PNG_MAGIC = b"\x89PNG"
+
+
+class TestLsRoot:
+    """5.1: rdc ls / lists root VFS entries."""
+
+    def test_root_entries(self, vkcube_session: str) -> None:
+        """Root listing contains expected top-level entries."""
+        out = rdc_ok("ls", "/", session=vkcube_session)
+        for name in ("info", "stats", "events", "draws", "resources", "textures", "shaders"):
+            assert name in out
+
+
+class TestLsLong:
+    """5.2: rdc ls -l / shows long format with NAME/TYPE columns."""
+
+    def test_long_format_columns(self, vkcube_session: str) -> None:
+        """Long format contains NAME and TYPE columns with kind indicators."""
+        out = rdc_ok("ls", "-l", "/", session=vkcube_session)
+        assert "NAME" in out
+        assert "TYPE" in out
+        for kind in ("leaf", "dir"):
+            assert kind in out
+
+
+class TestTreeRoot:
+    """5.3: rdc tree / --depth 1 shows tree formatting."""
+
+    def test_tree_formatting(self, vkcube_session: str) -> None:
+        """Tree output uses ASCII tree characters."""
+        out = rdc_ok("tree", "/", "--depth", "1", session=vkcube_session)
+        assert "|-- " in out
+
+
+class TestTreeDraws:
+    """5.4: rdc tree /draws --depth 2 shows draw subtree."""
+
+    def test_draws_subtree(self, vkcube_session: str) -> None:
+        """Draw subtree contains pipeline/, shader/, targets/ entries."""
+        out = rdc_ok("tree", "/draws", "--depth", "2", session=vkcube_session)
+        for name in ("pipeline", "shader", "targets"):
+            assert name in out
+
+
+class TestCatInfo:
+    """5.5: rdc cat /info shows capture metadata."""
+
+    def test_capture_info(self, vkcube_session: str) -> None:
+        """Capture info mentions Vulkan and Events."""
+        out = rdc_ok("cat", "/info", session=vkcube_session)
+        assert "Vulkan" in out or "vulkan" in out.lower()
+        assert "Events" in out or "events" in out.lower()
+
+
+class TestCatStats:
+    """5.6: rdc cat /stats shows per-pass data."""
+
+    def test_stats_output(self, vkcube_session: str) -> None:
+        """Stats output contains per_pass data."""
+        out = rdc_ok("cat", "/stats", session=vkcube_session)
+        assert "per_pass" in out or "pass" in out.lower()
+
+
+class TestCatLog:
+    """5.7: rdc cat /log shows log messages."""
+
+    def test_log_columns(self, vkcube_session: str) -> None:
+        """Log output has LEVEL, EID, MESSAGE header."""
+        out = rdc_ok("cat", "/log", session=vkcube_session)
+        assert "LEVEL" in out
+        assert "EID" in out
+        assert "MESSAGE" in out
+
+
+class TestCatCapabilities:
+    """5.8: rdc cat /capabilities shows capture capabilities."""
+
+    def test_capabilities(self, vkcube_session: str) -> None:
+        """Capabilities output contains capture info."""
+        out = rdc_ok("cat", "/capabilities", session=vkcube_session)
+        assert len(out.strip()) > 0
+
+
+class TestCatEvent:
+    """5.9: rdc cat /events/<draw_eid> shows event detail."""
+
+    def test_event_detail(self, vkcube_session: str, capture_meta: CaptureMetadata) -> None:
+        """Event detail contains Draw."""
+        out = rdc_ok("cat", f"/events/{capture_meta.draw_eid}", session=vkcube_session)
+        assert "Draw" in out or "draw" in out.lower()
+
+
+class TestCatPipelineTopology:
+    """5.10: rdc cat /draws/<draw_eid>/pipeline/topology shows TriangleList."""
+
+    def test_topology(self, vkcube_session: str, capture_meta: CaptureMetadata) -> None:
+        """Pipeline topology is TriangleList."""
+        out = rdc_ok(
+            "cat",
+            f"/draws/{capture_meta.draw_eid}/pipeline/topology",
+            session=vkcube_session,
+        )
+        assert "TriangleList" in out
+
+
+class TestCatShaderDisasm:
+    """5.11: rdc cat /draws/<draw_eid>/shader/vs/disasm shows SPIR-V disassembly."""
+
+    def test_spirv_disasm(self, vkcube_session: str, capture_meta: CaptureMetadata) -> None:
+        """Vertex shader disassembly contains SPIR-V markers."""
+        out = rdc_ok(
+            "cat",
+            f"/draws/{capture_meta.draw_eid}/shader/vs/disasm",
+            session=vkcube_session,
+        )
+        assert "SPIR-V" in out or "OpCapability" in out or "spir" in out.lower()
+
+
+class TestCatPostVS:
+    """5.12: rdc cat /draws/<draw_eid>/postvs shows post-VS data."""
+
+    def test_postvs_data(self, vkcube_session: str, capture_meta: CaptureMetadata) -> None:
+        """Post-VS data contains vertexResourceId."""
+        out = rdc_ok(
+            "cat",
+            f"/draws/{capture_meta.draw_eid}/postvs",
+            session=vkcube_session,
+        )
+        assert "vertexResourceId" in out or "vertex" in out.lower()
+
+
+class TestCatDescriptors:
+    """5.13: rdc cat /draws/<draw_eid>/descriptors shows descriptor columns."""
+
+    def test_descriptor_columns(self, vkcube_session: str, capture_meta: CaptureMetadata) -> None:
+        """Descriptors output has STAGE and TYPE columns."""
+        out = rdc_ok(
+            "cat",
+            f"/draws/{capture_meta.draw_eid}/descriptors",
+            session=vkcube_session,
+        )
+        assert "STAGE" in out
+        assert "TYPE" in out
+
+
+class TestCatResourceInfo:
+    """5.15: rdc cat /resources/<texture_id>/info shows resource detail."""
+
+    def test_resource_info(self, vkcube_session: str, capture_meta: CaptureMetadata) -> None:
+        """Resource info contains its id."""
+        tid_str = str(capture_meta.texture_id)
+        out = rdc_ok("cat", f"/resources/{tid_str}/info", session=vkcube_session)
+        assert tid_str in out
+
+
+class TestCatTextureInfo:
+    """5.16: rdc cat /textures/<texture_id>/info shows texture metadata."""
+
+    def test_texture_metadata(self, vkcube_session: str, capture_meta: CaptureMetadata) -> None:
+        """Texture info contains width, height, format."""
+        out = rdc_ok(
+            "cat",
+            f"/textures/{capture_meta.texture_id}/info",
+            session=vkcube_session,
+        )
+        assert "width" in out.lower()
+        assert "height" in out.lower()
+        assert "format" in out.lower()
+
+
+class TestCatShaderInfo:
+    """5.17: rdc cat /shaders/<vs_id>/info shows shader info."""
+
+    def test_shader_info(self, vkcube_session: str, capture_meta: CaptureMetadata) -> None:
+        """Shader info contains its id."""
+        sid_str = str(capture_meta.vs_id)
+        out = rdc_ok("cat", f"/shaders/{sid_str}/info", session=vkcube_session)
+        assert sid_str in out
+
+
+class TestLsTextures:
+    """5.18: rdc ls /textures lists texture IDs."""
+
+    def test_texture_ids(self, vkcube_session: str, capture_meta: CaptureMetadata) -> None:
+        """Texture listing includes all discovered texture IDs."""
+        out = rdc_ok("ls", "/textures", session=vkcube_session)
+        listed = {ln.strip() for ln in out.strip().splitlines() if ln.strip()}
+        for tid in capture_meta.texture_ids:
+            assert str(tid) in listed
+
+
+class TestLsShaders:
+    """5.19: rdc ls /shaders lists shader IDs."""
+
+    def test_shader_ids(self, vkcube_session: str, capture_meta: CaptureMetadata) -> None:
+        """Shader listing includes all discovered shader IDs."""
+        out = rdc_ok("ls", "/shaders", session=vkcube_session)
+        listed = {ln.strip() for ln in out.strip().splitlines() if ln.strip()}
+        for sid in capture_meta.shader_ids:
+            assert str(sid) in listed
+
+
+class TestLsPasses:
+    """5.20: rdc ls /passes lists pass names."""
+
+    def test_pass_names(self, vkcube_session: str) -> None:
+        """Pass listing is non-empty."""
+        out = rdc_ok("ls", "/passes", session=vkcube_session)
+        assert len(out.strip()) > 0
+
+
+class TestCatNotFound:
+    """5.22: rdc cat /nonexistent returns error exit 1."""
+
+    def test_not_found_error(self, vkcube_session: str) -> None:
+        """Accessing a non-existent path produces an error."""
+        out = rdc_fail("cat", "/nonexistent", session=vkcube_session, exit_code=1)
+        assert "error" in out.lower()
+
+
+class TestLsNotFound:
+    """5.23: rdc ls /nonexistent returns error exit 1."""
+
+    def test_not_found_error(self, vkcube_session: str) -> None:
+        """Listing a non-existent path produces an error."""
+        out = rdc_fail("ls", "/nonexistent", session=vkcube_session, exit_code=1)
+        assert "error" in out.lower()
+
+
+class TestCatTexturePng:
+    """5.25: rdc cat /textures/<texture_id>/image.png -o {tmp} creates a PNG."""
+
+    def test_texture_png_export(
+        self,
+        vkcube_session: str,
+        capture_meta: CaptureMetadata,
+        tmp_out: Path,
+    ) -> None:
+        """Exported texture is a valid PNG file."""
+        dest = tmp_out / "tex.png"
+        rdc_ok(
+            "cat",
+            f"/textures/{capture_meta.texture_id}/image.png",
+            "-o",
+            str(dest),
+            session=vkcube_session,
+        )
+        assert dest.exists()
+        assert dest.stat().st_size > 0
+        assert dest.read_bytes()[:4] == PNG_MAGIC
+
+
+class TestCatRenderTargetPng:
+    """5.26: rdc cat /draws/<draw_eid>/targets/color0.png -o {tmp} creates a PNG."""
+
+    def test_rt_png_export(
+        self,
+        vkcube_session: str,
+        capture_meta: CaptureMetadata,
+        tmp_out: Path,
+    ) -> None:
+        """Exported render target is a valid PNG file."""
+        dest = tmp_out / "rt.png"
+        rdc_ok(
+            "cat",
+            f"/draws/{capture_meta.draw_eid}/targets/color0.png",
+            "-o",
+            str(dest),
+            session=vkcube_session,
+        )
+        assert dest.exists()
+        assert dest.stat().st_size > 0
+        assert dest.read_bytes()[:4] == PNG_MAGIC
+
+
+class TestTreeBadFlag:
+    """5.27: rdc tree / --max-depth 1 exits with usage error."""
+
+    def test_bad_flag_exit_code(self, vkcube_session: str) -> None:
+        """Using --max-depth instead of --depth produces exit code 2."""
+        out = rdc_fail(
+            "tree",
+            "/",
+            "--max-depth",
+            "1",
+            session=vkcube_session,
+            exit_code=2,
+        )
+        assert "depth" in out.lower()
+
+
+class TestLsDrawPixel:
+    """5.28: rdc ls /draws/<draw_eid>/ includes pixel directory."""
+
+    def test_pixel_in_draw_listing(
+        self, vkcube_session: str, capture_meta: CaptureMetadata
+    ) -> None:
+        out = rdc_ok("ls", f"/draws/{capture_meta.draw_eid}", session=vkcube_session)
+        assert "pixel" in out
+
+
+class TestLsPassAttachments:
+    """5.29: rdc ls /passes/<name>/attachments/ shows color/depth entries."""
+
+    def test_attachments_listed(self, vkcube_session: str) -> None:
+        passes_out = rdc_ok("ls", "/passes", session=vkcube_session)
+        pass_name = passes_out.strip().splitlines()[0].strip()
+        out = rdc_ok("ls", f"/passes/{pass_name}/attachments", session=vkcube_session)
+        assert "color0" in out
+
+
+class TestCatShaderUsedBy:
+    """5.30: rdc cat /shaders/<vs_id>/used-by shows EID list."""
+
+    def test_shader_used_by(self, vkcube_session: str, capture_meta: CaptureMetadata) -> None:
+        out = rdc_ok(
+            "cat",
+            f"/shaders/{capture_meta.vs_id}/used-by",
+            session=vkcube_session,
+        )
+        assert str(capture_meta.draw_eid) in out
+
+
+class TestCatPassAttachment:
+    """5.31: rdc cat /passes/<name>/attachments/color0 shows attachment info."""
+
+    def test_attachment_info(self, vkcube_session: str) -> None:
+        passes_out = rdc_ok("ls", "/passes", session=vkcube_session)
+        pass_name = passes_out.strip().splitlines()[0].strip()
+        out = rdc_ok(
+            "cat",
+            f"/passes/{pass_name}/attachments/color0",
+            session=vkcube_session,
+        )
+        assert "resource_id" in out
+
+
+class TestTreeDrawsPixel:
+    """5.32: rdc tree /draws --depth 2 shows pixel entry."""
+
+    def test_pixel_in_draw_tree(self, vkcube_session: str) -> None:
+        out = rdc_ok("tree", "/draws", "--depth", "2", session=vkcube_session)
+        assert "pixel" in out
+
+
+class TestLsPassAttachmentsDepth:
+    """5.33: rdc ls /passes/<name>/attachments/ includes depth target."""
+
+    def test_depth_in_attachments(self, vkcube_session: str) -> None:
+        passes_out = rdc_ok("ls", "/passes", session=vkcube_session)
+        pass_name = passes_out.strip().splitlines()[0].strip()
+        out = rdc_ok("ls", f"/passes/{pass_name}/attachments", session=vkcube_session)
+        assert "depth" in out
+
+
+class TestCatPassAttachmentDepth:
+    """5.34: rdc cat /passes/<name>/attachments/depth shows depth resource."""
+
+    def test_depth_attachment(self, vkcube_session: str) -> None:
+        passes_out = rdc_ok("ls", "/passes", session=vkcube_session)
+        pass_name = passes_out.strip().splitlines()[0].strip()
+        out = rdc_ok(
+            "cat",
+            f"/passes/{pass_name}/attachments/depth",
+            session=vkcube_session,
+        )
+        assert "resource_id" in out
+
+
+class TestCatPassAttachmentInvalid:
+    """5.35: rdc cat /passes/<name>/attachments/color99 returns error."""
+
+    def test_invalid_attachment(self, vkcube_session: str) -> None:
+        passes_out = rdc_ok("ls", "/passes", session=vkcube_session)
+        pass_name = passes_out.strip().splitlines()[0].strip()
+        rdc_fail(
+            "cat",
+            f"/passes/{pass_name}/attachments/color99",
+            session=vkcube_session,
+            exit_code=1,
+        )
+
+
+class TestLsShaderUsedBy:
+    """5.36: rdc ls /shaders/<vs_id> lists used-by entry."""
+
+    def test_used_by_listed(self, vkcube_session: str, capture_meta: CaptureMetadata) -> None:
+        out = rdc_ok("ls", f"/shaders/{capture_meta.vs_id}", session=vkcube_session)
+        assert "used-by" in out
+
+
+class TestCatShaderUsedByOther:
+    """5.37: rdc cat /shaders/<ps_id>/used-by shows EID for other shader."""
+
+    def test_other_shader_used_by(self, vkcube_session: str, capture_meta: CaptureMetadata) -> None:
+        out = rdc_ok(
+            "cat",
+            f"/shaders/{capture_meta.ps_id}/used-by",
+            session=vkcube_session,
+        )
+        assert str(capture_meta.draw_eid) in out

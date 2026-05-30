@@ -1,0 +1,26 @@
+---
+import Docs from '../../layouts/Docs.astro';
+import data from '../../data/commands.json';
+---
+
+<Docs title="Command Reference">
+  <p>
+    All commands support <code>--json</code> for machine-readable output and
+    <code>--help</code> for detailed usage. TSV is the default output format.
+  </p>
+
+  {data.categories.map(cat => (
+    <Fragment>
+      <h2 id={cat.id}>{cat.name}</h2>
+      {cat.description && <p>{cat.description}</p>}
+
+      {cat.commands.map(cmd => (
+        <Fragment>
+          <h3 id={cmd.id}>{cmd.name}</h3>
+          <p set:html={cmd.help} />
+          <pre><code>{cmd.usage}</code></pre>
+        </Fragment>
+      ))}
+    </Fragment>
+  ))}
+</Docs>

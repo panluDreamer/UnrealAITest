@@ -1,0 +1,78 @@
+# Unreal Engine generated files
+Binaries/
+DerivedDataCache/
+Intermediate/
+Saved/
+
+# Unreal Engine generated files inside plugins
+# If a plugin is distributed as binary-only, remove the matching Binaries/ ignore rule for that plugin.
+Plugins/**/Binaries/
+Plugins/**/Intermediate/
+Plugins/**/Saved/
+Plugins/**/DerivedDataCache/
+Plugins/**/mcp_output/
+Plugins/**/.codebuddy/
+
+# Generated project / IDE files
+
+.vs/
+.vscode/
+.idea/
+*.sln
+*.suo
+*.opensdf
+*.sdf
+*.VC.db
+*.VC.VC.opendb
+*.xcodeproj/
+*.xcworkspace/
+
+# Build and automation outputs
+*.target
+*.modules
+*.version
+*.manifest
+*.exp
+*.lib
+*.pdb
+*.obj
+*.ilk
+*.idb
+*.ipdb
+*.iobj
+
+# Logs, crash reports, and profiling captures
+*.log
+*.dmp
+*.dump
+*.tmp
+*.temp
+*.trace
+*.utrace
+*.ucache
+
+# Unreal backup/autosave artifacts
+*_BuiltData.uasset
+*.autosave
+*.backup
+*.old
+
+# Packaging / staging outputs
+Releases/
+PackagedBuilds/
+StagedBuilds/
+
+# Python caches used by plugin tooling
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,948 @@
+"""Tests for daemon JSON-RPC handlers: info, stats, events, draws, event, draw, pass."""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+from conftest import make_daemon_state, rpc_request
+from mock_renderdoc import (
+    ActionDescription,
+    ActionFlags,
+    APIEvent,
+    Descriptor,
+    MockPipeState,
+    ResourceDescription,
+    ResourceFormat,
+    ResourceId,
+    ResourceType,
+    SDBasic,
+    SDChunk,
+    SDData,
+    SDObject,
+    SDType,
+    ShaderReflection,
+    ShaderStage,
+    StructuredFile,
+    TextureDescription,
+)
+
+from rdc.daemon_server import DaemonState, _handle_request
+
+
+def _build_actions():
+    shadow_begin = ActionDescription(
+        eventId=10,
+        flags=ActionFlags.BeginPass | ActionFlags.PassBoundary,
+        _name="Shadow",
+    )
+    draw1 = ActionDescription(
+        eventId=42,
+        flags=ActionFlags.Drawcall | ActionFlags.Indexed,
+        numIndices=3600,
+        numInstances=1,
+        _name="vkCmdDrawIndexed",
+        events=[APIEvent(eventId=42, chunkIndex=0)],
+    )
+    shadow_marker = ActionDescription(
+        eventId=41,
+        flags=ActionFlags.NoFlags,
+        _name="Shadow/Terrain",
+        children=[draw1],
+    )
+    shadow_end = ActionDescription(
+        eventId=50,
+        flags=ActionFlags.EndPass | ActionFlags.PassBoundary,
+        _name="EndPass",
+    )
+    dispatch = ActionDescription(eventId=300, flags=ActionFlags.Dispatch, _name="vkCmdDispatch")
+    return [shadow_begin, shadow_marker, shadow_end, dispatch]
+
+
+def _build_sf():
+    return StructuredFile(
+        chunks=[
+            SDChunk(
+                name="vkCmdDrawIndexed",
+                children=[
+                    SDObject(name="indexCount", data=SDData(basic=SDBasic(value=3600))),
+                    SDObject(name="instanceCount", data=SDData(basic=SDBasic(value=1))),
+                ],
+            ),
+        ]
+    )
+
+
+def _make_state():
+    actions = _build_actions()
+    sf = _build_sf()
+    ctrl = SimpleNamespace(
+        GetRootActions=lambda: actions,
+        GetResources=lambda: [],
+        GetAPIProperties=lambda: SimpleNamespace(pipelineType="Vulkan"),
+        GetPipelineState=lambda: SimpleNamespace(),
+        SetFrameEvent=lambda eid, force: None,
+        GetStructuredFile=lambda: sf,
+        GetDebugMessages=lambda: [],
+        Shutdown=lambda: None,
+    )
+    state = make_daemon_state(ctrl=ctrl, version=(1, 33), max_eid=300, structured_file=sf)
+    from rdc.vfs.tree_cache import build_vfs_skeleton
+
+    state.vfs_tree = build_vfs_skeleton(actions, [], sf=sf)
+    return state
+
+
+class TestInfoHandler:
+    def test_info_metadata(self):
+        resp, _ = _handle_request(rpc_request("info"), _make_state())
+        assert resp["result"]["Capture"] == "test.rdc"
+        assert resp["result"]["API"] == "Vulkan"
+
+    def test_info_no_adapter(self):
+        state = DaemonState(capture="test.rdc", current_eid=0, token="tok")
+        resp, _ = _handle_request(rpc_request("info"), state)
+        assert resp["error"]["code"] == -32002
+
+
+class TestStatsHandler:
+    def test_stats_per_pass(self):
+        resp, _ = _handle_request(rpc_request("stats"), _make_state())
+        assert len(resp["result"]["per_pass"]) > 0
+
+    def test_stats_top_draws(self):
+        resp, _ = _handle_request(rpc_request("stats"), _make_state())
+        assert len(resp["result"]["top_draws"]) >= 1
+
+    def test_stats_no_adapter(self):
+        state = DaemonState(capture="test.rdc", current_eid=0, token="tok")
+        resp, _ = _handle_request(rpc_request("stats"), state)
+        assert resp["error"]["code"] == -32002
+
+    def test_stats_largest_resources(self):
+        state = _make_state()
+        res = [
+            ResourceDescription(
+                resourceId=ResourceId(97),
+                name="albedo",
+                type=ResourceType.Texture,
+                byteSize=4194304,
+            ),
+            ResourceDescription(
+                resourceId=ResourceId(200),
+                name="shadowmap",
+                type=ResourceType.Texture,
+                byteSize=1048576,
+            ),
+            ResourceDescription(
+                resourceId=ResourceId(10),
+                name="vbuf",
+                type=ResourceType.Buffer,
+                byteSize=65536,
+            ),
+        ]
+        state.res_rid_map = {int(r.resourceId): r for r in res}
+        state.res_types = {int(r.resourceId): r.type.name for r in res}
+        state.tex_map = {
+            97: TextureDescription(
+                resourceId=ResourceId(97),
+                format=ResourceFormat(name="R8G8B8A8_UNORM"),
+            ),
+            200: TextureDescription(
+                resourceId=ResourceId(200),
+                format=ResourceFormat(name="D32_FLOAT"),
+            ),
+        }
+        resp, _ = _handle_request(rpc_request("stats"), state)
+        largest = resp["result"]["largest_resources"]
+        assert len(largest) == 3
+        assert largest[0]["id"] == 97
+        assert largest[0]["size"] == 4194304
+        assert largest[0]["format"] == "R8G8B8A8_UNORM"
+        assert largest[1]["id"] == 200
+        assert largest[2]["id"] == 10
+        assert largest[2]["format"] == "-"
+
+    def test_stats_largest_resources_fewer_than_5(self):
+        state = _make_state()
+        res = [
+            ResourceDescription(
+                resourceId=ResourceId(1),
+                name="buf",
+                type=ResourceType.Buffer,
+                byteSize=1024,
+            ),
+        ]
+        state.res_rid_map = {int(r.resourceId): r for r in res}
+        resp, _ = _handle_request(rpc_request("stats"), state)
+        largest = resp["result"]["largest_resources"]
+        assert len(largest) == 1
+        assert largest[0]["size"] == 1024
+
+    def test_stats_largest_resources_excludes_zero_size(self):
+        state = _make_state()
+        res = [
+            ResourceDescription(
+                resourceId=ResourceId(1),
+                name="nosize",
+                type=ResourceType.Buffer,
+                byteSize=0,
+            ),
+            ResourceDescription(
+                resourceId=ResourceId(2),
+                name="hassize",
+                type=ResourceType.Buffer,
+                byteSize=512,
+            ),
+        ]
+        state.res_rid_map = {int(r.resourceId): r for r in res}
+        resp, _ = _handle_request(rpc_request("stats"), state)
+        largest = resp["result"]["largest_resources"]
+        assert len(largest) == 1
+        assert largest[0]["name"] == "hassize"
+
+
+class TestEventsHandler:
+    def test_events_list(self):
+        resp, _ = _handle_request(rpc_request("events"), _make_state())
+        assert len(resp["result"]["events"]) > 0
+
+    def test_events_filter_type(self):
+        resp, _ = _handle_request(rpc_request("events", {"type": "draw"}), _make_state())
+        assert all(e["type"] in ("Draw", "DrawIndexed") for e in resp["result"]["events"])
+
+    def test_events_filter_name(self):
+        resp, _ = _handle_request(rpc_request("events", {"filter": "Shadow*"}), _make_state())
+        assert any("Shadow" in e["name"] for e in resp["result"]["events"])
+
+    def test_events_limit(self):
+        resp, _ = _handle_request(rpc_request("events", {"limit": 2}), _make_state())
+        assert len(resp["result"]["events"]) <= 2
+
+    def test_events_range(self):
+        resp, _ = _handle_request(rpc_request("events", {"range": "40:50"}), _make_state())
+        assert all(40 <= e["eid"] <= 50 for e in resp["result"]["events"])
+
+    def test_events_no_adapter(self):
+        state = DaemonState(capture="test.rdc", current_eid=0, token="tok")
+        resp, _ = _handle_request(rpc_request("events"), state)
+        assert resp["error"]["code"] == -32002
+
+
+class TestDrawsHandler:
+    def test_draws_list(self):
+        resp, _ = _handle_request(rpc_request("draws"), _make_state())
+        assert len(resp["result"]["draws"]) >= 1
+        assert "summary" in resp["result"]
+
+    def test_draws_filter_pass(self):
+        state = _make_state()
+        passes_resp, _ = _handle_request(rpc_request("passes"), state)
+        friendly = passes_resp["result"]["tree"]["passes"][0]["name"]
+        resp, _ = _handle_request(rpc_request("draws", {"pass": friendly}), state)
+        assert len(resp["result"]["draws"]) > 0
+        assert all(d["pass"] == friendly for d in resp["result"]["draws"])
+
+    def test_draws_sort_triangles(self):
+        resp, _ = _handle_request(rpc_request("draws", {"sort": "triangles"}), _make_state())
+        tris = [d["triangles"] for d in resp["result"]["draws"]]
+        assert tris == sorted(tris, reverse=True)
+
+    def test_draws_limit(self):
+        resp, _ = _handle_request(rpc_request("draws", {"limit": 1}), _make_state())
+        assert len(resp["result"]["draws"]) <= 1
+
+    def test_draws_empty_pass(self):
+        resp, _ = _handle_request(rpc_request("draws", {"pass": "NonExistent"}), _make_state())
+        assert len(resp["result"]["draws"]) == 0
+
+
+class TestEventHandler:
+    def test_event_detail(self):
+        resp, _ = _handle_request(rpc_request("event", {"eid": 42}), _make_state())
+        assert resp["result"]["EID"] == 42
+        assert resp["result"]["API Call"] == "vkCmdDrawIndexed"
+
+    def test_event_params(self):
+        resp, _ = _handle_request(rpc_request("event", {"eid": 42}), _make_state())
+        assert "indexCount" in str(resp["result"]["Parameters"])
+
+    def test_event_not_found(self):
+        resp, _ = _handle_request(rpc_request("event", {"eid": 99999}), _make_state())
+        assert resp["error"]["code"] == -32002
+
+    def test_event_missing_eid(self):
+        resp, _ = _handle_request(rpc_request("event"), _make_state())
+        assert resp["error"]["code"] == -32602
+
+
+class TestDrawHandler:
+    def test_draw_detail(self):
+        resp, _ = _handle_request(rpc_request("draw", {"eid": 42}), _make_state())
+        assert resp["result"]["Event"] == 42
+        assert resp["result"]["Triangles"] == 1200
+        assert resp["result"]["Instances"] == 1
+
+    def test_draw_current_eid(self):
+        state = _make_state()
+        state.current_eid = 42
+        resp, _ = _handle_request(rpc_request("draw"), state)
+        assert resp["result"]["Event"] == 42
+
+    def test_draw_not_found(self):
+        resp, _ = _handle_request(rpc_request("draw", {"eid": 99999}), _make_state())
+        assert resp["error"]["code"] == -32002
+
+
+class _IntLike:
+    """Helper that supports int() conversion for resource IDs."""
+
+    def __init__(self, val: int) -> None:
+        self._val = val
+
+    def __int__(self) -> int:
+        return self._val
+
+
+def _build_pass_actions() -> list[ActionDescription]:
+    """Hierarchical pass tree for pass handler tests."""
+    shadow_begin = ActionDescription(
+        eventId=10, flags=ActionFlags.BeginPass | ActionFlags.PassBoundary, _name="Shadow"
+    )
+    draw1 = ActionDescription(
+        eventId=42,
+        flags=ActionFlags.Drawcall | ActionFlags.Indexed,
+        numIndices=3600,
+        numInstances=1,
+        _name="vkCmdDrawIndexed",
+        events=[APIEvent(eventId=42, chunkIndex=0)],
+    )
+    shadow_begin.children = [draw1]
+    shadow_end = ActionDescription(
+        eventId=50, flags=ActionFlags.EndPass | ActionFlags.PassBoundary, _name="EndPass"
+    )
+    return [shadow_begin, shadow_end]
+
+
+def _make_pass_state():
+    """State with output targets on pipeline for pass detail tests."""
+    actions = _build_pass_actions()
+    sf = _build_sf()
+    pipe = SimpleNamespace(
+        GetOutputTargets=lambda: [SimpleNamespace(resource=_IntLike(10))],
+        GetDepthTarget=lambda: SimpleNamespace(resource=_IntLike(20)),
+    )
+    ctrl = SimpleNamespace(
+        GetRootActions=lambda: actions,
+        GetResources=lambda: [],
+        GetAPIProperties=lambda: SimpleNamespace(pipelineType="Vulkan"),
+        GetPipelineState=lambda: pipe,
+        SetFrameEvent=lambda eid, force: None,
+        GetStructuredFile=lambda: sf,
+        Shutdown=lambda: None,
+    )
+    return make_daemon_state(ctrl=ctrl, version=(1, 33), max_eid=300, structured_file=sf)
+
+
+def _make_log_state(messages=None):
+    """State with debug messages for log handler tests."""
+    actions = _build_actions()
+    sf = _build_sf()
+    msgs = messages or []
+    ctrl = SimpleNamespace(
+        GetRootActions=lambda: actions,
+        GetResources=lambda: [],
+        GetAPIProperties=lambda: SimpleNamespace(pipelineType="Vulkan"),
+        GetPipelineState=lambda: SimpleNamespace(),
+        SetFrameEvent=lambda eid, force: None,
+        GetStructuredFile=lambda: sf,
+        GetDebugMessages=lambda: msgs,
+        Shutdown=lambda: None,
+    )
+    return make_daemon_state(ctrl=ctrl, version=(1, 33), max_eid=300, structured_file=sf)
+
+
+class TestPassHandler:
+    def test_pass_by_index(self):
+        resp, _ = _handle_request(rpc_request("pass", {"index": 0}), _make_pass_state())
+        result = resp["result"]
+        assert result["name"] == "Shadow"
+        assert result["begin_eid"] == 10
+        assert result["draws"] == 1
+        assert result["triangles"] == 1200
+
+    def test_pass_by_name(self):
+        resp, _ = _handle_request(rpc_request("pass", {"name": "Shadow"}), _make_pass_state())
+        assert resp["result"]["name"] == "Shadow"
+
+    def test_pass_by_name_case_insensitive(self):
+        resp, _ = _handle_request(rpc_request("pass", {"name": "shadow"}), _make_pass_state())
+        assert resp["result"]["name"] == "Shadow"
+
+    def test_pass_not_found_index(self):
+        resp, _ = _handle_request(rpc_request("pass", {"index": 999}), _make_pass_state())
+        assert resp["error"]["code"] == -32001
+
+    def test_pass_not_found_name(self):
+        resp, _ = _handle_request(rpc_request("pass", {"name": "NoSuch"}), _make_pass_state())
+        assert resp["error"]["code"] == -32001
+
+    def test_pass_no_adapter(self):
+        state = DaemonState(capture="test.rdc", current_eid=0, token="tok")
+        resp, _ = _handle_request(rpc_request("pass", {"index": 0}), state)
+        assert resp["error"]["code"] == -32002
+
+    def test_pass_missing_params(self):
+        resp, _ = _handle_request(rpc_request("pass"), _make_pass_state())
+        assert resp["error"]["code"] == -32602
+
+    def test_pass_invalid_index(self):
+        resp, _ = _handle_request(rpc_request("pass", {"index": "abc"}), _make_pass_state())
+        assert resp["error"]["code"] == -32602
+
+    def test_pass_color_targets(self):
+        resp, _ = _handle_request(rpc_request("pass", {"index": 0}), _make_pass_state())
+        result = resp["result"]
+        assert len(result["color_targets"]) == 1
+        assert result["color_targets"][0]["id"] == 10
+        assert result["depth_target"]["id"] == 20
+
+    def test_pass_enriched_targets(self):
+        state = _make_pass_state()
+        state.tex_map = {
+            10: TextureDescription(
+                resourceId=ResourceId(10),
+                width=1920,
+                height=1080,
+                format=ResourceFormat(name="R8G8B8A8_UNORM"),
+            ),
+            20: TextureDescription(
+                resourceId=ResourceId(20),
+                width=1920,
+                height=1080,
+                format=ResourceFormat(name="D32_FLOAT"),
+            ),
+        }
+        state.res_names = {10: "albedo", 20: "depth"}
+        resp, _ = _handle_request(rpc_request("pass", {"index": 0}), state)
+        result = resp["result"]
+        c0 = result["color_targets"][0]
+        assert c0["id"] == 10
+        assert c0["name"] == "albedo"
+        assert c0["format"] == "R8G8B8A8_UNORM"
+        assert c0["width"] == 1920
+        assert c0["height"] == 1080
+        dt = result["depth_target"]
+        assert dt["id"] == 20
+        assert dt["name"] == "depth"
+        assert dt["format"] == "D32_FLOAT"
+
+    def test_pass_unknown_resource_fallback(self):
+        """Unknown resource ID (not in tex_map) falls back to ID-only."""
+        resp, _ = _handle_request(rpc_request("pass", {"index": 0}), _make_pass_state())
+        result = resp["result"]
+        c0 = result["color_targets"][0]
+        assert c0 == {"id": 10}
+        assert result["depth_target"] == {"id": 20}
+
+    def test_pass_no_color_targets(self):
+        """Pass with no color attachments, only depth."""
+        actions = _build_pass_actions()
+        sf = _build_sf()
+        pipe = SimpleNamespace(
+            GetOutputTargets=lambda: [],
+            GetDepthTarget=lambda: SimpleNamespace(resource=_IntLike(20)),
+        )
+        ctrl = SimpleNamespace(
+            GetRootActions=lambda: actions,
+            GetResources=lambda: [],
+            GetAPIProperties=lambda: SimpleNamespace(pipelineType="Vulkan"),
+            GetPipelineState=lambda: pipe,
+            SetFrameEvent=lambda eid, force: None,
+            GetStructuredFile=lambda: sf,
+            Shutdown=lambda: None,
+        )
+        state = make_daemon_state(ctrl=ctrl, version=(1, 33), max_eid=300, structured_file=sf)
+        resp, _ = _handle_request(rpc_request("pass", {"index": 0}), state)
+        result = resp["result"]
+        assert result["color_targets"] == []
+        assert result["depth_target"]["id"] == 20
+
+    def test_pass_no_depth(self):
+        """Pass with no depth target."""
+        actions = _build_pass_actions()
+        sf = _build_sf()
+        pipe = SimpleNamespace(
+            GetOutputTargets=lambda: [SimpleNamespace(resource=_IntLike(10))],
+            GetDepthTarget=lambda: SimpleNamespace(resource=_IntLike(0)),
+        )
+        ctrl = SimpleNamespace(
+            GetRootActions=lambda: actions,
+            GetResources=lambda: [],
+            GetAPIProperties=lambda: SimpleNamespace(pipelineType="Vulkan"),
+            GetPipelineState=lambda: pipe,
+            SetFrameEvent=lambda eid, force: None,
+            GetStructuredFile=lambda: sf,
+            Shutdown=lambda: None,
+        )
+        state = make_daemon_state(ctrl=ctrl, version=(1, 33), max_eid=300, structured_file=sf)
+        resp, _ = _handle_request(rpc_request("pass", {"index": 0}), state)
+        result = resp["result"]
+        assert len(result["color_targets"]) == 1
+        assert result["depth_target"] is None
+
+
+class TestLogHandler:
+    def test_log_messages(self):
+        msgs = [
+            SimpleNamespace(severity=0, eventId=0, description="validation error"),
+            SimpleNamespace(severity=3, eventId=42, description="info message"),
+        ]
+        resp, _ = _handle_request(rpc_request("log"), _make_log_state(msgs))
+        result = resp["result"]["messages"]
+        assert len(result) == 2
+        assert result[0]["level"] == "HIGH"
+        assert result[0]["eid"] == 0
+        assert result[1]["level"] == "INFO"
+        assert result[1]["eid"] == 42
+
+    def test_log_filter_level(self):
+        msgs = [
+            SimpleNamespace(severity=0, eventId=0, description="error"),
+            SimpleNamespace(severity=3, eventId=10, description="info"),
+        ]
+        resp, _ = _handle_request(rpc_request("log", {"level": "HIGH"}), _make_log_state(msgs))
+        result = resp["result"]["messages"]
+        assert len(result) == 1
+        assert result[0]["level"] == "HIGH"
+
+    def test_log_filter_eid(self):
+        msgs = [
+            SimpleNamespace(severity=0, eventId=0, description="global"),
+            SimpleNamespace(severity=1, eventId=42, description="at eid 42"),
+        ]
+        resp, _ = _handle_request(rpc_request("log", {"eid": 42}), _make_log_state(msgs))
+        result = resp["result"]["messages"]
+        assert len(result) == 1
+        assert result[0]["eid"] == 42
+
+    def test_log_filter_eid_zero(self):
+        msgs = [
+            SimpleNamespace(severity=0, eventId=0, description="global"),
+            SimpleNamespace(severity=1, eventId=42, description="at eid 42"),
+        ]
+        resp, _ = _handle_request(rpc_request("log", {"eid": 0}), _make_log_state(msgs))
+        result = resp["result"]["messages"]
+        assert len(result) == 1
+        assert result[0]["message"] == "global"
+
+    def test_log_empty(self):
+        resp, _ = _handle_request(rpc_request("log"), _make_log_state([]))
+        assert resp["result"]["messages"] == []
+
+    def test_log_no_adapter(self):
+        state = DaemonState(capture="test.rdc", current_eid=0, token="tok")
+        resp, _ = _handle_request(rpc_request("log"), state)
+        assert resp["error"]["code"] == -32002
+
+    def test_log_invalid_level(self):
+        resp, _ = _handle_request(rpc_request("log", {"level": "HIHG"}), _make_log_state([]))
+        assert resp["error"]["code"] == -32602
+
+    def test_log_invalid_eid(self):
+        resp, _ = _handle_request(rpc_request("log", {"eid": "abc"}), _make_log_state([]))
+        assert resp["error"]["code"] == -32602
+
+
+class TestEventMultiChunk:
+    def _make_multi_chunk_state(self):
+        sf = StructuredFile(
+            chunks=[
+                SDChunk(
+                    name="vkCmdSetViewport",
+                    children=[
+                        SDObject(name="viewportCount", data=SDData(basic=SDBasic(value=1))),
+                    ],
+                ),
+                SDChunk(
+                    name="vkCmdDrawIndexed",
+                    children=[
+                        SDObject(name="indexCount", data=SDData(basic=SDBasic(value=3600))),
+                        SDObject(name="instanceCount", data=SDData(basic=SDBasic(value=1))),
+                    ],
+                ),
+            ]
+        )
+        action = ActionDescription(
+            eventId=42,
+            flags=ActionFlags.Drawcall | ActionFlags.Indexed,
+            numIndices=3600,
+            numInstances=1,
+            _name="vkCmdDrawIndexed",
+            events=[
+                APIEvent(eventId=42, chunkIndex=0),
+                APIEvent(eventId=42, chunkIndex=1),
+            ],
+        )
+        ctrl = SimpleNamespace(
+            GetRootActions=lambda: [action],
+            GetResources=lambda: [],
+            GetAPIProperties=lambda: SimpleNamespace(pipelineType="Vulkan"),
+            GetPipelineState=lambda: SimpleNamespace(),
+            SetFrameEvent=lambda eid, force: None,
+            GetStructuredFile=lambda: sf,
+            GetDebugMessages=lambda: [],
+            Shutdown=lambda: None,
+        )
+        state = make_daemon_state(ctrl=ctrl, version=(1, 33), max_eid=42, structured_file=sf)
+        from rdc.vfs.tree_cache import build_vfs_skeleton
+
+        state.vfs_tree = build_vfs_skeleton([action], [], sf=sf)
+        return state
+
+    def test_all_chunk_params_present(self):
+        resp, _ = _handle_request(rpc_request("event", {"eid": 42}), self._make_multi_chunk_state())
+        params_str = resp["result"]["Parameters"]
+        assert "viewportCount" in params_str
+        assert "indexCount" in params_str
+        assert "instanceCount" in params_str
+
+    def test_last_chunk_wins_api_call(self):
+        resp, _ = _handle_request(rpc_request("event", {"eid": 42}), self._make_multi_chunk_state())
+        assert resp["result"]["API Call"] == "vkCmdDrawIndexed"
+
+
+# ---------------------------------------------------------------------------
+# Tests: B16 — mesh dispatch (MeshDispatch = 0x0008) classified as draw
+# ---------------------------------------------------------------------------
+
+
+def _build_mesh_actions():
+    """Action tree with a single mesh dispatch action."""
+    mesh_draw = ActionDescription(
+        eventId=10,
+        flags=ActionFlags.MeshDispatch,
+        numIndices=0,
+        numInstances=1,
+        _name="vkCmdDrawMeshTasksEXT",
+    )
+    return [mesh_draw]
+
+
+def _make_mesh_state():
+    actions = _build_mesh_actions()
+    sf = StructuredFile()
+    ctrl = SimpleNamespace(
+        GetRootActions=lambda: actions,
+        GetResources=lambda: [],
+        GetAPIProperties=lambda: SimpleNamespace(pipelineType="Vulkan"),
+        GetPipelineState=lambda: SimpleNamespace(),
+        SetFrameEvent=lambda eid, force: None,
+        GetStructuredFile=lambda: sf,
+        GetDebugMessages=lambda: [],
+        Shutdown=lambda: None,
+    )
+    state = make_daemon_state(ctrl=ctrl, version=(1, 33), max_eid=10, structured_file=sf)
+    from rdc.vfs.tree_cache import build_vfs_skeleton
+
+    state.vfs_tree = build_vfs_skeleton(actions, [], sf=sf)
+    return state
+
+
+class TestMeshDispatchClassification:
+    def test_mesh_dispatch_action_type_str(self):
+        from rdc.handlers._helpers import _action_type_str
+
+        assert _action_type_str(0x0008) == "Draw"
+        assert _action_type_str(0x0008) != "Other"
+
+    def test_mesh_dispatch_classified_as_draw_in_events(self):
+        resp, _ = _handle_request(rpc_request("events"), _make_mesh_state())
+        events = resp["result"]["events"]
+        mesh_ev = [e for e in events if e["eid"] == 10]
+        assert len(mesh_ev) == 1
+        assert mesh_ev[0]["type"] != "Other"
+        assert mesh_ev[0]["type"] == "Draw"
+
+    def test_mesh_dispatch_included_in_draws_list(self):
+        resp, _ = _handle_request(rpc_request("draws"), _make_mesh_state())
+        draws = resp["result"]["draws"]
+        mesh_draws = [d for d in draws if d["eid"] == 10]
+        assert len(mesh_draws) == 1
+
+    def test_mesh_dispatch_counted_as_draw(self):
+        resp, _ = _handle_request(rpc_request("count", {"what": "draws"}), _make_mesh_state())
+        assert resp["result"]["value"] == 1
+
+    def test_mesh_dispatch_in_info_draw_calls(self):
+        resp, _ = _handle_request(rpc_request("info"), _make_mesh_state())
+        draw_calls = resp["result"]["Draw Calls"]
+        assert "1 " in draw_calls
+
+    def test_mesh_dispatch_not_classified_as_dispatch(self):
+        resp, _ = _handle_request(rpc_request("count", {"what": "dispatches"}), _make_mesh_state())
+        assert resp["result"]["value"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Gap 2: pass_attachment handler
+# ---------------------------------------------------------------------------
+
+
+def _make_pass_attachment_state():
+    """State with a pass and pipeline targets for attachment tests."""
+    actions = _build_actions()
+    sf = _build_sf()
+    resources = [ResourceDescription(resourceId=ResourceId(100), name="tex0")]
+    pipe = MockPipeState(
+        output_targets=[
+            Descriptor(resource=ResourceId(300)),
+            Descriptor(resource=ResourceId(400)),
+        ],
+        depth_target=Descriptor(resource=ResourceId(500)),
+    )
+    ctrl = SimpleNamespace(
+        GetRootActions=lambda: actions,
+        GetResources=lambda: resources,
+        GetAPIProperties=lambda: SimpleNamespace(pipelineType="Vulkan"),
+        GetPipelineState=lambda: pipe,
+        SetFrameEvent=lambda eid, force: None,
+        GetStructuredFile=lambda: sf,
+        GetDebugMessages=lambda: [],
+        Shutdown=lambda: None,
+    )
+    state = make_daemon_state(ctrl=ctrl, version=(1, 33), max_eid=300, structured_file=sf)
+    from rdc.vfs.tree_cache import build_vfs_skeleton
+
+    state.vfs_tree = build_vfs_skeleton(actions, resources, sf=sf)
+    return state
+
+
+class TestPassAttachmentHandler:
+    def test_returns_color_resource_id(self):
+        state = _make_pass_attachment_state()
+        resp, _ = _handle_request(
+            rpc_request("pass_attachment", {"name": "Shadow", "attachment": "color0"}), state
+        )
+        assert "error" not in resp
+        assert resp["result"]["resource_id"] == 300
+
+    def test_returns_depth_resource_id(self):
+        state = _make_pass_attachment_state()
+        resp, _ = _handle_request(
+            rpc_request("pass_attachment", {"name": "Shadow", "attachment": "depth"}), state
+        )
+        assert "error" not in resp
+        assert resp["result"]["resource_id"] == 500
+
+    def test_color_not_found(self):
+        state = _make_pass_attachment_state()
+        resp, _ = _handle_request(
+            rpc_request("pass_attachment", {"name": "Shadow", "attachment": "color99"}), state
+        )
+        assert resp["error"]["code"] == -32001
+
+    def test_pass_not_found(self):
+        state = _make_pass_attachment_state()
+        resp, _ = _handle_request(
+            rpc_request("pass_attachment", {"name": "NonExistent", "attachment": "color0"}), state
+        )
+        assert resp["error"]["code"] == -32001
+
+    def test_no_adapter(self):
+        state = DaemonState(capture="test.rdc", current_eid=0, token="tok")
+        resp, _ = _handle_request(
+            rpc_request("pass_attachment", {"name": "Shadow", "attachment": "color0"}), state
+        )
+        assert resp["error"]["code"] == -32002
+
+
+# ---------------------------------------------------------------------------
+# Gap 3: shader_used_by handler
+# ---------------------------------------------------------------------------
+
+
+def _make_shader_used_by_state():
+    """State with shader cache for used-by tests."""
+    pipe = MockPipeState()
+    pipe._shaders[ShaderStage.Vertex] = ResourceId(100)
+    pipe._shaders[ShaderStage.Pixel] = ResourceId(200)
+    refl_vs = ShaderReflection(resourceId=ResourceId(100), entryPoint="vs_main")
+    refl_ps = ShaderReflection(resourceId=ResourceId(200), entryPoint="ps_main")
+    pipe._reflections[ShaderStage.Vertex] = refl_vs
+    pipe._reflections[ShaderStage.Pixel] = refl_ps
+
+    actions = [
+        ActionDescription(eventId=10, flags=ActionFlags.Drawcall, numIndices=3, _name="Draw1"),
+        ActionDescription(eventId=20, flags=ActionFlags.Drawcall, numIndices=3, _name="Draw2"),
+    ]
+    ctrl = SimpleNamespace(
+        GetRootActions=lambda: actions,
+        GetResources=lambda: [ResourceDescription(resourceId=ResourceId(1), name="res0")],
+        GetAPIProperties=lambda: SimpleNamespace(pipelineType="Vulkan"),
+        GetPipelineState=lambda: pipe,
+        SetFrameEvent=lambda eid, force: None,
+        GetStructuredFile=lambda: SimpleNamespace(chunks=[]),
+        GetDebugMessages=lambda: [],
+        Shutdown=lambda: None,
+        DisassembleShader=lambda p, r, t: "; disasm",
+        GetDisassemblyTargets=lambda _with_pipeline=False: ["SPIR-V"],
+    )
+    state = make_daemon_state(ctrl=ctrl, version=(1, 33), max_eid=20)
+    from rdc.vfs.tree_cache import build_vfs_skeleton
+
+    state.vfs_tree = build_vfs_skeleton(actions, [])
+    return state
+
+
+class TestShaderUsedByHandler:
+    def test_returns_eids(self):
+        state = _make_shader_used_by_state()
+        resp, _ = _handle_request(rpc_request("shader_used_by", {"id": 100}), state)
+        assert "error" not in resp
+        assert isinstance(resp["result"]["eids"], list)
+        assert set(resp["result"]["eids"]) == {10, 20}
+
+    def test_all_eids_correct(self):
+        state = _make_shader_used_by_state()
+        resp, _ = _handle_request(rpc_request("shader_used_by", {"id": 200}), state)
+        assert "error" not in resp
+        assert set(resp["result"]["eids"]) == {10, 20}
+
+    def test_not_found(self):
+        state = _make_shader_used_by_state()
+        # Build cache first
+        _handle_request(rpc_request("shader_used_by", {"id": 100}), state)
+        resp, _ = _handle_request(rpc_request("shader_used_by", {"id": 9999}), state)
+        assert resp["error"]["code"] == -32001
+
+    def test_no_adapter(self):
+        state = DaemonState(capture="test.rdc", current_eid=0, token="tok")
+        resp, _ = _handle_request(rpc_request("shader_used_by", {"id": 100}), state)
+        assert resp["error"]["code"] == -32002
+
+    def test_cache_auto_build(self):
+        state = _make_shader_used_by_state()
+        assert not state._shader_cache_built
+        resp, _ = _handle_request(rpc_request("shader_used_by", {"id": 100}), state)
+        assert "error" not in resp
+        assert state._shader_cache_built
+
+
+# ---------------------------------------------------------------------------
+# B75: SDObject value extraction by basetype
+# ---------------------------------------------------------------------------
+
+
+def _make_b75_state(children: list[SDObject]) -> DaemonState:
+    """Build state with custom SDObject children for B75 tests."""
+    sf = StructuredFile(chunks=[SDChunk(name="vkCmdDraw", children=children)])
+    action = ActionDescription(
+        eventId=42,
+        flags=ActionFlags.Drawcall,
+        _name="vkCmdDraw",
+        events=[APIEvent(eventId=42, chunkIndex=0)],
+    )
+    ctrl = SimpleNamespace(
+        GetRootActions=lambda: [action],
+        GetResources=lambda: [],
+        GetAPIProperties=lambda: SimpleNamespace(pipelineType="Vulkan"),
+        GetPipelineState=lambda: SimpleNamespace(),
+        SetFrameEvent=lambda eid, force: None,
+        GetStructuredFile=lambda: sf,
+        GetDebugMessages=lambda: [],
+        Shutdown=lambda: None,
+    )
+    return make_daemon_state(ctrl=ctrl, version=(1, 41), max_eid=42, structured_file=sf)
+
+
+class TestB75SDValueExtraction:
+    """B75: parameter values must use typed extraction, not AsString()."""
+
+    def test_unsigned_integer(self) -> None:
+        child = SDObject(
+            name="count",
+            type=SDType(basetype=7),
+            data=SDData(basic=SDBasic(u=255)),
+        )
+        state = _make_b75_state([child])
+        resp, _ = _handle_request(rpc_request("event", {"eid": 42}), state)
+        assert "255" in resp["result"]["Parameters"]
+
+    def test_signed_integer(self) -> None:
+        child = SDObject(
+            name="offset",
+            type=SDType(basetype=8),
+            data=SDData(basic=SDBasic(i=-42)),
+        )
+        state = _make_b75_state([child])
+        resp, _ = _handle_request(rpc_request("event", {"eid": 42}), state)
+        assert "-42" in resp["result"]["Parameters"]
+
+    def test_float(self) -> None:
+        child = SDObject(
+            name="blend",
+            type=SDType(basetype=9),
+            data=SDData(basic=SDBasic(d=3.14)),
+        )
+        state = _make_b75_state([child])
+        resp, _ = _handle_request(rpc_request("event", {"eid": 42}), state)
+        assert "3.14" in resp["result"]["Parameters"]
+
+    def test_boolean(self) -> None:
+        child = SDObject(
+            name="enabled",
+            type=SDType(basetype=10),
+            data=SDData(basic=SDBasic(b=True)),
+        )
+        state = _make_b75_state([child])
+        resp, _ = _handle_request(rpc_request("event", {"eid": 42}), state)
+        assert "True" in resp["result"]["Parameters"]
+
+    def test_resource(self) -> None:
+        child = SDObject(
+            name="buffer",
+            type=SDType(basetype=12),
+            data=SDData(basic=SDBasic(id=42)),
+        )
+        state = _make_b75_state([child])
+        resp, _ = _handle_request(rpc_request("event", {"eid": 42}), state)
+        assert "42" in resp["result"]["Parameters"]
+
+    def test_string(self) -> None:
+        child = SDObject(
+            name="label",
+            type=SDType(basetype=5),
+            data=SDData(str="hello"),
+        )
+        state = _make_b75_state([child])
+        resp, _ = _handle_request(rpc_request("event", {"eid": 42}), state)
+        assert "hello" in resp["result"]["Parameters"]
+
+    def test_enum(self) -> None:
+        child = SDObject(
+            name="format",
+            type=SDType(basetype=6),
+            data=SDData(str="VK_FORMAT_R8G8B8A8_UNORM"),
+        )
+        state = _make_b75_state([child])
+        resp, _ = _handle_request(rpc_request("event", {"eid": 42}), state)
+        assert "VK_FORMAT_R8G8B8A8_UNORM" in resp["result"]["Parameters"]
+
+    def test_legacy_no_type(self) -> None:
+        child = SDObject(
+            name="vertexCount",
+            data=SDData(basic=SDBasic(value=3600)),
+        )
+        state = _make_b75_state([child])
+        resp, _ = _handle_request(rpc_request("event", {"eid": 42}), state)
+        assert "3600" in resp["result"]["Parameters"]
+
+    def test_unknown_basetype_fallback(self) -> None:
+        child = SDObject(
+            name="mystery",
+            type=SDType(basetype=99),
+            data=SDData(basic=SDBasic(value=777)),
+        )
+        state = _make_b75_state([child])
+        resp, _ = _handle_request(rpc_request("event", {"eid": 42}), state)
+        assert "777" in resp["result"]["Parameters"]

@@ -1,0 +1,127 @@
+# Summary Generation — Sub-Agent Prompt
+
+Shared prompt template used by `ue-knowledge-init`, `ue-knowledge-reader`,
+and `ue-knowledge-update` when generating summaries via sub-agents.
+
+## How to Use
+
+1. Query module/submodule info (see each prompt below)
+2. Pick the matching prompt template (Single-Module / Batch / Single-Submodule / Batch-Submodule)
+3. Fill in `{placeholders}` with actual values
+4. Append the **Common Rules** section verbatim to the end
+5. Launch a sub-agent (Task tool) with the filled prompt
+
+---
+
+## Common Rules
+
+Append this block to every prompt below:
+
+```
+Context limits:
+- Read at most 3 headers (first 200 lines only)
+- Use Glob/Grep to identify key files, do NOT read every file
+- STOP after completing the assigned scope
+
+Quality rules:
+- Purpose is one sentence
+- Key Concepts lists actual classes from headers you read
+- Entry Points have verified file paths (confirmed via Glob)
+- No fabricated class names or file paths
+- For classes that serve as cross-module data carriers (passed between modules as
+  function parameters or stored in shared structures), list 2-3 key fields in
+  the Key Concepts description, not just the class name
+- Set "Last Updated" to {today's date}
+```
+
+Additional rules **for module summaries**: 60-150 lines total.
+Additional rules **for submodule summaries**: 30-80 lines total; "Internal Architecture" describes how pieces connect within the submodule; Purpose is scoped to the submodule, not the whole module.
+
+---
+
+## Single-Module Prompt
+
+Use for **one** module (on-demand from reader/update):
+
+```
+Generate a SUMMARY.md file for the Unreal Engine 4.26 module "{Name}".
+
+Module info:
+- Path: {path}
+- Type: {type}, Layer: {layer}
+- Public deps: {public_deps}
+- Private deps: {private_deps}
+
+Steps:
+1. Glob its Public/ headers: {path}/Public/**/*.h
+2. Read at most 3 important headers (prioritize UCLASS/USTRUCT or main header)
+3. Grep for IMPLEMENT_MODULE to find the module's main .cpp
+4. Read the template: Skills/ue-knowledge-init/references/summary-template.md
+5. Generate the summary following that template
+6. Write it to Knowledge/modules/{Name}.md
+```
+
+## Batch-Module Prompt
+
+Use for **multiple** modules (init Phase 2 batch dispatch):
+
+```
+Generate SUMMARY.md files for these {N} Unreal Engine 4.26 modules.
+
+Modules to process:
+- {Name} (type: {type}, layer: {layer})
+  Path: {path}
+  Public deps: {public_deps}
+  Private deps: {private_deps}
+[repeat for each module in batch]
+
+For EACH module, follow the same steps as Single-Module above.
+Write each to {modules_dir}/{Name}.md.
+```
+
+## Single-Submodule Prompt
+
+Use for **one** submodule (on-demand from reader/update):
+
+```
+Generate a submodule summary for "{SubmoduleName}" within the UE4.26 module "{ModuleName}".
+
+Parent module summary: {modules_dir}/{ModuleName}.md (read it first for context)
+
+Submodule info:
+- Detection method: {detection}
+- File count: {file_count}
+- Source dirs: {source_dirs}
+- Key files: {key_files}
+
+Steps:
+1. Read the parent module summary: Knowledge/modules/{ModuleName}.md
+2. Glob the submodule's files: {module_path}/{source_dirs}/**/*.h and **/*.cpp
+3. Read at most 3 important headers (prioritize UCLASS/USTRUCT or main header)
+4. Read the submodule template: Skills/ue-knowledge-init/references/submodule-template.md
+5. Generate the summary following that template
+6. Write it to Knowledge/modules/{ModuleName}/{SubmoduleName}.md
+```
+
+## Batch-Submodule Prompt
+
+Use for **multiple** submodules of one parent module (init Phase 2b):
+
+```
+Generate submodule summaries for these {N} submodules of the UE4.26 module "{ModuleName}".
+
+Parent module:
+- Name: {ModuleName}
+- Path: {module_path}
+- Summary: {modules_dir}/{ModuleName}.md (read it ONCE, reuse for all)
+
+Submodules to process:
+- {SubmoduleName} (detection: {detection}, files: {file_count})
+  Source dirs: {source_dirs}
+  Key files: {key_files}
+[repeat for each submodule in batch]
+
+For EACH submodule, follow the same steps as Single-Submodule above.
+Read the parent module summary ONCE, reuse for all submodules.
+Write each to {modules_dir}/{ModuleName}/{SubmoduleName}.md.
+```
